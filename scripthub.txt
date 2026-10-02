@@ -1,634 +1,305 @@
--- CustomUI.lua
--- Place in: ReplicatedStorage > ModuleScript > "CustomUI"
+-- Delta Hub — Cloud Relay Client
+-- Relay: https://serverssszz.onrender.com/
+-- Run this in Delta on every device. No host device required.
 
-local CustomUI = {}
+---------------------------------------------------------------------
+-- CONFIG
+---------------------------------------------------------------------
+local RELAY_WS      = "wss://serverssszz.onrender.com"
+local HEARTBEAT_SEC = 8   -- sends a ping every 4 min to keep Render awake
+local RECONNECT_SEC = 5     -- wait between reconnect attempts
 
-local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-local LocalPlayer = Players.LocalPlayer
+---------------------------------------------------------------------
+-- IMPORTS
+---------------------------------------------------------------------
+local Players   = game:GetService("Players")
+local HttpSvc   = game:GetService("HttpService")
+local Teleport  = game:GetService("TeleportService")
+local Market    = game:GetService("MarketplaceService")
+local GuiSvc    = game:GetService("GuiService")
+local LP        = Players.LocalPlayer
 
--- ============ THEME ============
+local WebSocket  = WebSocket or (syn and syn.websocket) or nil
+local loadstring = loadstring or nil
+assert(loadstring, "Delta required (loadstring missing).")
+assert(WebSocket, "Delta required (WebSocket missing).")
+
+---------------------------------------------------------------------
+-- UI
+---------------------------------------------------------------------
 local Theme = {
-    Background = Color3.fromRGB(20, 20, 24),
-    Secondary  = Color3.fromRGB(30, 30, 36),
-    Tertiary   = Color3.fromRGB(42, 42, 50),
-    Hover      = Color3.fromRGB(54, 54, 64),
-    Accent     = Color3.fromRGB(120, 90, 255),
-    Text       = Color3.fromRGB(240, 240, 245),
-    TextDim    = Color3.fromRGB(150, 150, 165),
-    Stroke     = Color3.fromRGB(48, 48, 58),
-    Success    = Color3.fromRGB(85, 200, 120),
-    Error      = Color3.fromRGB(230, 90, 90),
+  Bg=Color3.fromRGB(18,18,22), Panel=Color3.fromRGB(28,28,34),
+  Hover=Color3.fromRGB(44,44,54), Accent=Color3.fromRGB(120,90,255),
+  Text=Color3.fromRGB(238,238,242), Dim=Color3.fromRGB(150,150,165),
+  Stroke=Color3.fromRGB(48,48,58), Good=Color3.fromRGB(85,200,120),
+  Bad=Color3.fromRGB(230,90,90),
 }
-CustomUI.Theme = Theme
+local function C(c,p) local i=Instance.new(c) for k,v in pairs(p or {}) do if k~="Parent" then i[k]=v end end if p and p.Parent then i.Parent=p.Parent end return i end
+local function corner(p,r) return C("UICorner",{CornerRadius=UDim.new(0,r or 6),Parent=p}) end
+local function stroke(p,c) return C("UIStroke",{Color=c or Theme.Stroke,Thickness=1,Parent=p}) end
+local function pad(p,n) return C("UIPadding",{PaddingTop=UDim.new(0,n),PaddingBottom=UDim.new(0,n),PaddingLeft=UDim.new(0,n),PaddingRight=UDim.new(0,n),Parent=p}) end
 
--- ============ HELPERS ============
-local function Create(class, props)
-    local inst = Instance.new(class)
-    for k, v in pairs(props or {}) do
-        if k ~= "Parent" then inst[k] = v end
+local gui = C("ScreenGui",{Name="DeltaHubUI",ResetOnSpawn=false,IgnoreGuiInset=true,ZIndexBehavior=Enum.ZIndexBehavior.Sibling,Parent=LP:WaitForChild("PlayerGui")})
+local win = C("Frame",{BackgroundColor3=Theme.Bg,Size=UDim2.new(0,620,0,430),Position=UDim2.new(0.5,-310,0.5,-215),Parent=gui})
+corner(win,10); stroke(win)
+local title = C("Frame",{BackgroundColor3=Theme.Panel,Size=UDim2.new(1,0,0,34),BorderSizePixel=0,Parent=win})
+corner(title,10)
+C("Frame",{BackgroundColor3=Theme.Panel,Size=UDim2.new(1,0,0,10),Position=UDim2.new(0,0,1,-10),BorderSizePixel=0,Parent=title})
+C("TextLabel",{BackgroundTransparency=1,Position=UDim2.new(0,14,0,0),Size=UDim2.new(1,-100,1,0),Font=Enum.Font.GothamBold,Text="Delta Hub — Cloud Relay",TextColor3=Theme.Text,TextSize=14,TextXAlignment=Enum.TextXAlignment.Left,Parent=title})
+
+-- Connection status dot in titlebar
+local statusDot = C("Frame",{BackgroundColor3=Theme.Dim,Size=UDim2.new(0,8,0,8),Position=UDim2.new(1,-90,0.5,-4),BorderSizePixel=0,Parent=title})
+corner(statusDot,4)
+local statusLbl = C("TextLabel",{BackgroundTransparency=1,Position=UDim2.new(1,-78,0,0),Size=UDim2.new(0,50,1,0),Font=Enum.Font.Gotham,Text="offline",TextColor3=Theme.Dim,TextSize=11,TextXAlignment=Enum.TextXAlignment.Left,Parent=title})
+
+local close = C("TextButton",{BackgroundColor3=Theme.Panel,Size=UDim2.new(0,22,0,22),Position=UDim2.new(1,-28,0.5,-11),Font=Enum.Font.GothamBold,Text="×",TextColor3=Theme.Text,TextSize=16,AutoButtonColor=false,BorderSizePixel=0,Parent=title})
+corner(close,5)
+close.MouseEnter:Connect(function() close.BackgroundColor3=Theme.Bad end)
+close.MouseLeave:Connect(function() close.BackgroundColor3=Theme.Panel end)
+close.MouseButton1Click:Connect(function() gui:Destroy() end)
+
+local dragging,dragStart,startPos
+title.InputBegan:Connect(function(input) if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then dragging=true; dragStart=input.Position; startPos=win.Position; input.Changed:Connect(function() if input.UserInputState==Enum.UserInputState.End then dragging=false end end) end end)
+game:GetService("UserInputService").InputChanged:Connect(function(input) if dragging and (input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch) then local d=input.Position-dragStart; win.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,startPos.Y.Scale,startPos.Y.Offset+d.Y) end end)
+
+local tabBar = C("Frame",{BackgroundColor3=Theme.Bg,Position=UDim2.new(0,0,0,34),Size=UDim2.new(0,52,1,-34),BorderSizePixel=0,Parent=win})
+C("Frame",{BackgroundColor3=Theme.Stroke,Size=UDim2.new(0,1,1,-10),Position=UDim2.new(1,-1,0,5),BorderSizePixel=0,Parent=tabBar})
+C("UIListLayout",{Padding=UDim.new(0,6),HorizontalAlignment=Enum.HorizontalAlignment.Center,VerticalAlignment=Enum.VerticalAlignment.Top,SortOrder=Enum.SortOrder.LayoutOrder,Parent=tabBar})
+pad(tabBar,6)
+local content = C("Frame",{BackgroundTransparency=1,Position=UDim2.new(0,52,0,34),Size=UDim2.new(1,-52,1,-34),Parent=win})
+local pages={}
+local function makeTab(name,icon)
+  local btn=C("TextButton",{BackgroundColor3=Theme.Panel,Size=UDim2.new(1,0,0,36),Font=Enum.Font.GothamBold,Text=icon or name:sub(1,1):upper(),TextColor3=Theme.Dim,TextSize=16,AutoButtonColor=false,BorderSizePixel=0,Parent=tabBar})
+  corner(btn,6)
+  local page=C("ScrollingFrame",{BackgroundTransparency=1,Size=UDim2.new(1,0,1,0),BorderSizePixel=0,CanvasSize=UDim2.new(0,0,0,0),AutomaticCanvasSize=Enum.AutomaticSize.Y,ScrollBarThickness=4,ScrollBarImageColor3=Theme.Panel,Visible=false,Parent=content})
+  pad(page,10)
+  C("UIListLayout",{Padding=UDim.new(0,8),SortOrder=Enum.SortOrder.LayoutOrder,Parent=page})
+  pages[#pages+1]={btn=btn,page=page}
+  btn.MouseButton1Click:Connect(function() for _,p in ipairs(pages) do p.page.Visible=(p.page==page); p.btn.BackgroundColor3=(p.page==page) and Theme.Accent or Theme.Panel; p.btn.TextColor3=(p.page==page) and Theme.Text or Theme.Dim end end)
+  return page
+end
+
+local function Section(parent,text) C("TextLabel",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,22),Font=Enum.Font.GothamBold,Text=text:upper(),TextColor3=Theme.Dim,TextSize=11,TextXAlignment=Enum.TextXAlignment.Left,Parent=parent}) end
+local function Label(parent,text) local l=C("TextLabel",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,22),Font=Enum.Font.Gotham,Text=text,TextColor3=Theme.Text,TextSize=13,TextXAlignment=Enum.TextXAlignment.Left,AutomaticSize=Enum.AutomaticSize.Y,TextWrapped=true,Parent=parent}); return {Instance=l,Set=function(_,t) l.Text=t end} end
+local function Button(parent,name,image,cb)
+  local f=C("Frame",{BackgroundColor3=Theme.Panel,Size=UDim2.new(1,0,0,34),Parent=parent}); corner(f,6); stroke(f)
+  local textX=12; local img
+  if image then img=C("ImageLabel",{BackgroundTransparency=1,Size=UDim2.new(0,24,0,24),Position=UDim2.new(0,8,0.5,-12),Image=image,Parent=f}); corner(img,4); textX=38 end
+  C("TextLabel",{BackgroundTransparency=1,Position=UDim2.new(0,textX,0,0),Size=UDim2.new(1,-textX-8,1,0),Font=Enum.Font.Gotham,Text=name,TextColor3=Theme.Text,TextSize=13,TextXAlignment=Enum.TextXAlignment.Left,Parent=f})
+  local btn=C("TextButton",{BackgroundTransparency=1,Size=UDim2.new(1,0,1,0),Text="",Parent=f})
+  btn.MouseEnter:Connect(function() f.BackgroundColor3=Theme.Hover end)
+  btn.MouseLeave:Connect(function() f.BackgroundColor3=Theme.Panel end)
+  btn.MouseButton1Click:Connect(function() local ok,err=pcall(cb); if not ok then warn("[Hub] Button error:",err) end end)
+  return {Instance=f}
+end
+local function Input(parent,placeholder,default)
+  local f=C("Frame",{BackgroundColor3=Theme.Panel,Size=UDim2.new(1,0,0,32),Parent=parent}); corner(f,6); stroke(f)
+  local box=C("TextBox",{BackgroundTransparency=1,Position=UDim2.new(0,10,0,0),Size=UDim2.new(1,-20,1,0),Font=Enum.Font.Gotham,Text=default or "",PlaceholderText=placeholder or "Type...",PlaceholderColor3=Theme.Dim,TextColor3=Theme.Text,TextSize=13,TextXAlignment=Enum.TextXAlignment.Left,ClearTextOnFocus=false,Parent=f})
+  return {Instance=f,Get=function() return box.Text end}
+end
+local function MultiLineInput(parent,placeholder)
+  local f=C("Frame",{BackgroundColor3=Theme.Panel,Size=UDim2.new(1,0,0,140),Parent=parent}); corner(f,6); stroke(f)
+  local box=C("TextBox",{BackgroundTransparency=1,Position=UDim2.new(0,10,0,8),Size=UDim2.new(1,-20,1,-16),Font=Enum.Font.Code,Text="",PlaceholderText=placeholder or "-- script",PlaceholderColor3=Theme.Dim,TextColor3=Theme.Text,TextSize=13,TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,ClearTextOnFocus=false,MultiLine=true,TextWrapped=true,Parent=f})
+  return {Instance=f,Get=function() return box.Text end,Set=function(_,t) box.Text=t end}
+end
+
+local notifHolder=C("Frame",{Name="Notifs",BackgroundTransparency=1,Size=UDim2.new(0,300,1,-20),Position=UDim2.new(1,-10,0,10),AnchorPoint=UDim2.new(1,0,0,0),Parent=gui})
+C("UIListLayout",{Padding=UDim.new(0,6),HorizontalAlignment=Enum.HorizontalAlignment.Right,VerticalAlignment=Enum.VerticalAlignment.Top,SortOrder=Enum.SortOrder.LayoutOrder,Parent=notifHolder})
+local function notify(title,body,color)
+  color=color or Theme.Accent
+  local f=C("Frame",{BackgroundColor3=Theme.Panel,Size=UDim2.new(1,-10,0,64),Parent=notifHolder}); corner(f,8); stroke(f)
+  C("Frame",{BackgroundColor3=color,Size=UDim2.new(0,4,1,-16),Position=UDim2.new(0,8,0.5,0),AnchorPoint=UDim2.new(0,0,0.5,0),BorderSizePixel=0,Parent=f})
+  C("TextLabel",{BackgroundTransparency=1,Position=UDim2.new(0,22,0,8),Size=UDim2.new(1,-30,0,18),Font=Enum.Font.GothamBold,Text=title,TextColor3=Theme.Text,TextSize=13,TextXAlignment=Enum.TextXAlignment.Left,Parent=f})
+  C("TextLabel",{BackgroundTransparency=1,Position=UDim2.new(0,22,0,28),Size=UDim2.new(1,-30,1,-34),Font=Enum.Font.Gotham,Text=body or "",TextColor3=Theme.Dim,TextSize=12,TextWrapped=true,TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,Parent=f})
+  task.delay(4,function() if f.Parent then local tw=game:GetService("TweenService"):Create(f,TweenInfo.new(0.25),{BackgroundTransparency=1}); tw:Play(); tw.Completed:Wait(); f:Destroy() end end)
+end
+
+local function setStatus(state)  -- "online" | "connecting" | "offline"
+  if state=="online" then statusDot.BackgroundColor3=Theme.Good; statusLbl.Text="online"
+  elseif state=="connecting" then statusDot.BackgroundColor3=Color3.fromRGB(230,180,90); statusLbl.Text="connecting"
+  else statusDot.BackgroundColor3=Theme.Dim; statusLbl.Text="offline" end
+end
+
+---------------------------------------------------------------------
+-- HELPERS
+---------------------------------------------------------------------
+local thumbCache={}
+local function getThumb(uid) if thumbCache[uid] then return thumbCache[uid] end local ok,url=pcall(function() return Players:GetUserThumbnailAsync(uid,Enum.ThumbnailType.HeadShot,Enum.ThumbnailSize.Size100x100) end) thumbCache[uid]=ok and url or "rbxassetid://0" return thumbCache[uid] end
+local placeNameCache={}
+local function getPlaceName(pid) if not pid or pid==0 then return "Unknown" end if placeNameCache[pid] then return placeNameCache[pid] end local ok,info=pcall(function() return Market:GetProductInfo(pid) end) placeNameCache[pid]=(ok and info and info.Name) or ("Place "..pid) return placeNameCache[pid] end
+
+---------------------------------------------------------------------
+-- RELAY CLIENT
+---------------------------------------------------------------------
+local hubUsers={}
+local selectedUser=nil
+local socket=nil
+local connected=false
+
+local function send(msg)
+  if socket and connected then
+    pcall(function() socket:Send(HttpSvc:JSONEncode(msg)) end)
+  end
+end
+
+local function handleExecute(msg)
+  local fn,compileErr=loadstring(msg.script)
+  if fn then
+    local ok,execErr=pcall(fn)
+    send({type="output",targetUserId=msg.fromUserId,userId=LP.UserId,
+      output=ok and "Executed OK" or tostring(execErr),
+      error=ok and nil or tostring(execErr)})
+  else
+    send({type="output",targetUserId=msg.fromUserId,userId=LP.UserId,
+      output="Compile error",error=tostring(compileErr)})
+  end
+end
+
+-- Cold-start aware connect: Render free tier can take 30-60s to wake.
+-- We retry with backoff until connected, then register.
+local function connectRelay()
+  setStatus("connecting")
+  local attempt=0
+  while true do
+    attempt=attempt+1
+    local ok,ws=pcall(function() return WebSocket.connect(RELAY_WS) end)
+    if ok and ws then
+      socket=ws
+      connected=true
+      setStatus("online")
+      notify("Relay Connected", RELAY_WS, Theme.Good)
+
+      send({
+        type="identify",
+        userId=LP.UserId,
+        displayName=LP.DisplayName,
+        placeId=game.PlaceId,
+        jobId=game.JobId,
+        gameId=game.GameId,
+      })
+
+      ws.OnMessage:Connect(function(raw)
+        local ok2,data=pcall(HttpSvc.JSONDecode,HttpSvc,raw)
+        if not ok2 or not data then return end
+
+        if data.type=="userList" then
+          hubUsers={}
+          for _,u in ipairs(data.users or {}) do hubUsers[u.userId]=u end
+          refreshPlayerList()
+
+        elseif data.type=="userJoined" then
+          hubUsers[data.userId]=data; refreshPlayerList()
+
+        elseif data.type=="userLeft" then
+          hubUsers[data.userId]=nil; refreshPlayerList()
+
+        elseif data.type=="execute" then
+          if data.targetUserId==LP.UserId then task.spawn(handleExecute,data) end
+
+        elseif data.type=="output" then
+          if data.targetUserId==LP.UserId then
+            outputLabel:Set("Output:\n"..tostring(data.output or "—")
+              .."\n\nError:\n"..tostring(data.error or "—"))
+          end
+
+        elseif data.type=="pong" then
+          -- heartbeat ack, do nothing
+        end
+      end)
+
+      ws.OnClose:Connect(function()
+        connected=false
+        setStatus("offline")
+        notify("Relay Closed","Reconnecting in "..RECONNECT_SEC.."s...",Theme.Bad)
+        task.wait(RECONNECT_SEC)
+        connectRelay()
+      end)
+
+      return
+    else
+      -- failed — likely still spinning up
+      setStatus("connecting")
+      if attempt==1 or attempt%3==0 then
+        notify("Waking Relay","Attempt "..attempt.." — Render may be cold-starting (up to 60s)...",Theme.Accent)
+      end
+      task.wait(3)
     end
-    if props and props.Parent then inst.Parent = props.Parent end
-    return inst
+  end
 end
 
-local function Corner(parent, r)
-    return Create("UICorner", { CornerRadius = UDim.new(0, r or 6), Parent = parent })
-end
-
-local function Stroke(parent, c, t)
-    return Create("UIStroke", {
-        Color = c or Theme.Stroke,
-        Thickness = t or 1,
-        Parent = parent,
-    })
-end
-
-local function Pad(parent, n)
-    return Create("UIPadding", {
-        PaddingTop = UDim.new(0, n), PaddingBottom = UDim.new(0, n),
-        PaddingLeft = UDim.new(0, n), PaddingRight = UDim.new(0, n),
-        Parent = parent,
-    })
-end
-
-local function List(parent, props)
-    local p = props or {}
-    p.Parent = parent
-    return Create("UIListLayout", p)
-end
-
--- ============ NOTIFICATIONS ============
-local notifHolder
-local function ensureNotifs()
-    if notifHolder and notifHolder.Parent then return notifHolder end
-    local gui = LocalPlayer:WaitForChild("PlayerGui")
-    local sg = gui:FindFirstChild("CustomUI_Notifs")
-    if not sg then
-        sg = Create("ScreenGui", {
-            Name = "CustomUI_Notifs", ResetOnSpawn = false,
-            IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-            DisplayOrder = 999, Parent = gui,
-        })
+-- Heartbeat: keeps the Render free instance awake while Delta is open
+task.spawn(function()
+  while true do
+    task.wait(HEARTBEAT_SEC)
+    if connected then
+      send({type="ping",userId=LP.UserId})
     end
-    local holder = sg:FindFirstChild("Holder")
-    if not holder then
-        holder = Create("Frame", {
-            Name = "Holder", BackgroundTransparency = 1,
-            Size = UDim2.new(0, 320, 1, -20),
-            Position = UDim2.new(1, -10, 0, 10),
-            AnchorPoint = UDim2.new(1, 0, 0, 0),
-            Parent = sg,
-        })
-        List(holder, {
-            Padding = UDim.new(0, 6),
-            HorizontalAlignment = Enum.HorizontalAlignment.Right,
-            VerticalAlignment = Enum.VerticalAlignment.Top,
-            SortOrder = Enum.SortOrder.LayoutOrder,
-        })
-    end
-    notifHolder = holder
-    return holder
-end
+  end
+end)
 
-function CustomUI:Notify(props)
-    props = props or {}
-    local holder = ensureNotifs()
-    local dur = props.Duration or 4
-    local frame = Create("Frame", {
-        BackgroundColor3 = Theme.Secondary,
-        Size = UDim2.new(1, -10, 0, 70),
-        Parent = holder,
-    })
-    Corner(frame, 8); Stroke(frame, Theme.Stroke, 1)
-
-    local accentColor = props.Color or Theme.Accent
-    local accent = Create("Frame", {
-        BackgroundColor3 = accentColor,
-        Size = UDim2.new(0, 4, 1, -16),
-        Position = UDim2.new(0, 8, 0.5, 0),
-        AnchorPoint = UDim2.new(0, 0, 0.5, 0),
-        BorderSizePixel = 0, Parent = frame,
-    })
-    Corner(accent, 2)
-
-    Create("TextLabel", {
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 22, 0, 10),
-        Size = UDim2.new(1, -30, 0, 20),
-        Font = Enum.Font.GothamBold, Text = props.Title or "Notification",
-        TextColor3 = Theme.Text, TextSize = 14,
-        TextXAlignment = Enum.TextXAlignment.Left, Parent = frame,
-    })
-    Create("TextLabel", {
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 22, 0, 32),
-        Size = UDim2.new(1, -30, 1, -38),
-        Font = Enum.Font.Gotham, Text = props.Content or "",
-        TextColor3 = Theme.TextDim, TextSize = 12, TextWrapped = true,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        TextYAlignment = Enum.TextYAlignment.Top, Parent = frame,
-    })
-
-    frame.Position = UDim2.new(0, 340, 0, 0)
-    TweenService:Create(frame, TweenInfo.new(0.3, Enum.EasingStyle.Quart), {
-        Position = UDim2.new(0, 0, 0, 0),
-    }):Play()
-
-    task.delay(dur, function()
-        if not frame.Parent then return end
-        local t = TweenService:Create(frame, TweenInfo.new(0.25), {
-            Position = UDim2.new(0, 340, 0, 0),
-            BackgroundTransparency = 1,
-        })
-        t:Play(); t.Completed:Wait()
-        frame:Destroy()
+---------------------------------------------------------------------
+-- UI TABS
+---------------------------------------------------------------------
+local playersTab=makeTab("Players","👥")
+Section(playersTab,"Connected Hub Users")
+local playersSection=C("Frame",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,Parent=playersTab})
+local playerButtons={}
+function refreshPlayerList()
+  for _,b in ipairs(playerButtons) do if b.Instance then b.Instance:Destroy() end end
+  playerButtons={}
+  local count=0
+  for uid,u in pairs(hubUsers) do
+    count=count+1
+    local thumb=getThumb(uid)
+    local pname=getPlaceName(u.placeId)
+    local label=u.displayName.." — "..pname
+    if uid==LP.UserId then label=label.."  (you)" end
+    Button(playersSection,label,thumb,function()
+      selectedUser=u
+      joinLabel:Set("Selected: "..u.displayName
+        .."\nGame: "..pname
+        .."\nPlace ID: "..tostring(u.placeId)
+        .."\nJob ID: "..tostring(u.jobId))
+      execTargetLabel:Set("Target: "..u.displayName)
+      notify("Selected",u.displayName,Theme.Accent)
     end)
+  end
+  if count==0 then Section(playersSection,"No other hub users connected.") end
 end
 
--- ============ WINDOW ============
-local Window = {}
-Window.__index = Window
+local joinTab=makeTab("Join","🔗")
+Section(joinTab,"Selected Player")
+local joinLabel=Label(joinTab,"Select a player.")
+Button(joinTab,"🔗 Join Player",nil,function()
+  if not selectedUser then notify("Error","No player selected.",Theme.Bad); return end
+  if not selectedUser.jobId or selectedUser.jobId=="" then notify("Error","No server info.",Theme.Bad); return end
+  local ok=pcall(function() Teleport:TeleportToPlaceInstance(selectedUser.placeId,selectedUser.jobId,LP) end)
+  if ok then notify("Joining","Connecting to "..selectedUser.displayName.."'s server...",Theme.Good)
+  else GuiSvc:OpenBrowserWindow("roblox://placeId="..selectedUser.placeId.."&gameInstanceId="..selectedUser.jobId) end
+end)
 
-function CustomUI:CreateWindow(props)
-    props = props or {}
-    local gui = LocalPlayer:WaitForChild("PlayerGui")
-    local sg = Create("ScreenGui", {
-        Name = "CustomUI_" .. (props.Title or "Win"),
-        ResetOnSpawn = false, IgnoreGuiInset = true,
-        ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Parent = gui,
-    })
+local execTab=makeTab("Executor","⚡")
+Section(execTab,"Target")
+local execTargetLabel=Label(execTab,"No target selected.")
+Section(execTab,"Script")
+local execInput=MultiLineInput(execTab,"-- write Lua to run on the target")
+Section(execTab,"Actions")
+Button(execTab,"⚡ Execute on Target",nil,function()
+  if not selectedUser then notify("No Target","Pick a target.",Theme.Bad); return end
+  local code=execInput:Get()
+  if code=="" then notify("Empty","Write a script.",Theme.Bad); return end
+  send({type="execute",targetUserId=selectedUser.userId,script=code,fromUserId=LP.UserId})
+  notify("Dispatched","Sent to "..selectedUser.displayName,Theme.Good)
+end)
 
-    local main = Create("Frame", {
-        BackgroundColor3 = Theme.Background,
-        Size = UDim2.new(0, 580, 0, 400),
-        Position = UDim2.new(0.5, -290, 0.5, -200),
-        Parent = sg,
-    })
-    Corner(main, 10); Stroke(main, Theme.Stroke, 1)
+local outTab=makeTab("Output","📄")
+Section(outTab,"Live Output")
+local outputLabel=Label(outTab,"No output yet.")
+Button(outTab,"🗑 Clear",nil,function() outputLabel:Set("—") end)
 
-    -- Titlebar
-    local titleBar = Create("Frame", {
-        BackgroundColor3 = Theme.Secondary,
-        Size = UDim2.new(1, 0, 0, 34), BorderSizePixel = 0, Parent = main,
-    })
-    Corner(titleBar, 10)
-    Create("Frame", {
-        BackgroundColor3 = Theme.Secondary,
-        Size = UDim2.new(1, 0, 0, 10), Position = UDim2.new(0, 0, 1, -10),
-        BorderSizePixel = 0, Parent = titleBar,
-    })
-
-    Create("TextLabel", {
-        BackgroundTransparency = 1, Position = UDim2.new(0, 14, 0, 0),
-        Size = UDim2.new(1, -100, 1, 0), Font = Enum.Font.GothamBold,
-        Text = props.Title or "Window", TextColor3 = Theme.Text,
-        TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left,
-        Parent = titleBar,
-    })
-
-    local minBtn = Create("TextButton", {
-        BackgroundColor3 = Theme.Tertiary, Size = UDim2.new(0, 22, 0, 22),
-        Position = UDim2.new(1, -54, 0.5, -11), Font = Enum.Font.GothamBold,
-        Text = "—", TextColor3 = Theme.Text, TextSize = 14,
-        AutoButtonColor = false, BorderSizePixel = 0, Parent = titleBar,
-    })
-    Corner(minBtn, 5)
-
-    local closeBtn = Create("TextButton", {
-        BackgroundColor3 = Theme.Tertiary, Size = UDim2.new(0, 22, 0, 22),
-        Position = UDim2.new(1, -28, 0.5, -11), Font = Enum.Font.GothamBold,
-        Text = "×", TextColor3 = Theme.Text, TextSize = 16,
-        AutoButtonColor = false, BorderSizePixel = 0, Parent = titleBar,
-    })
-    Corner(closeBtn, 5)
-
-    closeBtn.MouseEnter:Connect(function() closeBtn.BackgroundColor3 = Theme.Error end)
-    closeBtn.MouseLeave:Connect(function() closeBtn.BackgroundColor3 = Theme.Tertiary end)
-    closeBtn.MouseButton1Click:Connect(function() sg:Destroy() end)
-
-    local minimized, fullSize = false, main.Size
-    minBtn.MouseButton1Click:Connect(function()
-        minimized = not minimized
-        main.Size = minimized and UDim2.new(0, 580, 0, 34) or fullSize
-        minBtn.Text = minimized and "▢" or "—"
-    end)
-
-    -- Drag
-    local dragging, dragStart, startPos
-    titleBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPos = main.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch) then
-            local d = input.Position - dragStart
-            main.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + d.X,
-                startPos.Y.Scale, startPos.Y.Offset + d.Y)
-        end
-    end)
-
-    -- Sidebar
-    local sidebar = Create("Frame", {
-        BackgroundColor3 = Theme.Background,
-        Position = UDim2.new(0, 0, 0, 34),
-        Size = UDim2.new(0, 48, 1, -34), BorderSizePixel = 0, Parent = main,
-    })
-    Create("Frame", {
-        BackgroundColor3 = Theme.Stroke, Size = UDim2.new(0, 1, 1, -10),
-        Position = UDim2.new(1, -1, 0, 5), BorderSizePixel = 0, Parent = sidebar,
-    })
-    List(sidebar, {
-        Padding = UDim.new(0, 6),
-        HorizontalAlignment = Enum.HorizontalAlignment.Center,
-        VerticalAlignment = Enum.VerticalAlignment.Top,
-        SortOrder = Enum.SortOrder.LayoutOrder,
-    })
-    Pad(sidebar, 6)
-
-    local contentHolder = Create("Frame", {
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 48, 0, 34),
-        Size = UDim2.new(1, -48, 1, -34), Parent = main,
-    })
-
-    return setmetatable({
-        Instance = main, Gui = sg, Tabs = {},
-        ContentHolder = contentHolder, Sidebar = sidebar,
-    }, Window)
-end
-
-function Window:Tab(name, icon)
-    local btn = Create("TextButton", {
-        Name = name .. "_TabBtn", BackgroundColor3 = Theme.Secondary,
-        Size = UDim2.new(1, 0, 0, 36), Font = Enum.Font.GothamBold,
-        Text = icon or string.sub(name, 1, 1):upper(),
-        TextColor3 = Theme.TextDim, TextSize = 16,
-        AutoButtonColor = false, BorderSizePixel = 0, Parent = self.Sidebar,
-    })
-    Corner(btn, 6)
-
-    local page = Create("ScrollingFrame", {
-        Name = name .. "_Page", BackgroundTransparency = 1,
-        Size = UDim2.new(1, 0, 1, 0), BorderSizePixel = 0,
-        CanvasSize = UDim2.new(0, 0, 0, 0),
-        AutomaticCanvasSize = Enum.AutomaticSize.Y,
-        ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.Tertiary,
-        Visible = false, Parent = self.ContentHolder,
-    })
-    Pad(page, 10)
-    List(page, { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder })
-
-    local tab = { Name = name, Button = btn, Page = page, Window = self }
-    table.insert(self.Tabs, tab)
-
-    local function select()
-        for _, t in ipairs(self.Tabs) do
-            t.Page.Visible = (t == tab)
-            TweenService:Create(t.Button, TweenInfo.new(0.15), {
-                BackgroundColor3 = (t == tab) and Theme.Accent or Theme.Secondary,
-                TextColor3 = (t == tab) and Theme.Text or Theme.TextDim,
-            }):Play()
-        end
-    end
-    btn.MouseButton1Click:Connect(select)
-    if #self.Tabs == 1 then select() end
-
-    return tab
-end
-
--- ============ TAB SECTIONS ============
-local Tab = {}
-Tab.__index = Tab
-
-local function makeElementFactories(page)
-    local F = {}
-
-    function F:Section(name)
-        local header = Create("TextLabel", {
-            BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 22),
-            Font = Enum.Font.GothamBold, Text = string.upper(name or "SECTION"),
-            TextColor3 = Theme.TextDim, TextSize = 11,
-            TextXAlignment = Enum.TextXAlignment.Left, Parent = page,
-        })
-    end
-
-    function F:Label(text, color)
-        local l = Create("TextLabel", {
-            BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 22),
-            Font = Enum.Font.Gotham, Text = text or "",
-            TextColor3 = color or Theme.Text, TextSize = 13,
-            TextXAlignment = Enum.TextXAlignment.Left,
-            TextWrapped = true, AutomaticSize = Enum.AutomaticSize.Y,
-            Parent = page,
-        })
-        return {
-            Instance = l,
-            Set = function(_, t) l.Text = t end,
-        }
-    end
-
-    function F:Button(props)
-        props = props or {}
-        local frame = Create("Frame", {
-            BackgroundColor3 = Theme.Secondary,
-            Size = UDim2.new(1, 0, 0, 34), Parent = page,
-        })
-        Corner(frame, 6); Stroke(frame, Theme.Stroke, 1)
-
-        local img
-        local textX = 12
-        if props.Image then
-            img = Create("ImageLabel", {
-                BackgroundTransparency = 1,
-                Size = UDim2.new(0, 24, 0, 24),
-                Position = UDim2.new(0, 8, 0.5, -12),
-                Image = props.Image, Parent = frame,
-            })
-            Corner(img, 4)
-            textX = 38
-        end
-
-        local label = Create("TextLabel", {
-            BackgroundTransparency = 1, Position = UDim2.new(0, textX, 0, 0),
-            Size = UDim2.new(1, -textX - 8, 1, 0),
-            Font = Enum.Font.Gotham, Text = props.Name or "Button",
-            TextColor3 = Theme.Text, TextSize = 13,
-            TextXAlignment = Enum.TextXAlignment.Left, Parent = frame,
-        })
-
-        local btn = Create("TextButton", {
-            BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, 0),
-            Text = "", Parent = frame,
-        })
-
-        btn.MouseEnter:Connect(function()
-            TweenService:Create(frame, TweenInfo.new(0.15), {
-                BackgroundColor3 = Theme.Hover }):Play()
-        end)
-        btn.MouseLeave:Connect(function()
-            TweenService:Create(frame, TweenInfo.new(0.15), {
-                BackgroundColor3 = Theme.Secondary }):Play()
-        end)
-        btn.MouseButton1Click:Connect(function()
-            if props.Callback then
-                local ok, err = pcall(props.Callback)
-                if not ok then warn("[CustomUI] Button error:", err) end
-            end
-        end)
-
-        return {
-            Instance = frame,
-            SetText = function(_, t) label.Text = t end,
-            SetImage = function(_, url)
-                if img then img.Image = url
-                else
-                    img = Create("ImageLabel", {
-                        BackgroundTransparency = 1,
-                        Size = UDim2.new(0, 24, 0, 24),
-                        Position = UDim2.new(0, 8, 0.5, -12),
-                        Image = url, Parent = frame,
-                    })
-                    Corner(img, 4)
-                    label.Position = UDim2.new(0, 38, 0, 0)
-                    label.Size = UDim2.new(1, -46, 1, 0)
-                end
-            end,
-        }
-    end
-
-    function F:Input(props)
-        props = props or {}
-        local frame = Create("Frame", {
-            BackgroundColor3 = Theme.Secondary,
-            Size = UDim2.new(1, 0, 0, 32), Parent = page,
-        })
-        Corner(frame, 6); Stroke(frame, Theme.Stroke, 1)
-
-        local box = Create("TextBox", {
-            BackgroundTransparency = 1, Position = UDim2.new(0, 10, 0, 0),
-            Size = UDim2.new(1, -20, 1, 0), Font = Enum.Font.Gotham,
-            Text = props.Default or "", PlaceholderText = props.Placeholder or "Type...",
-            PlaceholderColor3 = Theme.TextDim, TextColor3 = Theme.Text,
-            TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left,
-            ClearTextOnFocus = false, Parent = frame,
-        })
-
-        if props.Callback then
-            box.FocusLost:Connect(function()
-                local ok, err = pcall(props.Callback, box.Text)
-                if not ok then warn(err) end
-            end)
-            box:GetPropertyChangedSignal("Text"):Connect(function()
-                local ok, err = pcall(props.Callback, box.Text)
-                if not ok then warn(err) end
-            end)
-        end
-
-        return {
-            Instance = frame,
-            Get = function() return box.Text end,
-            Set = function(_, t) box.Text = t end,
-        }
-    end
-
-    function F:Toggle(props)
-        props = props or {}
-        local frame = Create("Frame", {
-            BackgroundColor3 = Theme.Secondary,
-            Size = UDim2.new(1, 0, 0, 32), Parent = page,
-        })
-        Corner(frame, 6); Stroke(frame, Theme.Stroke, 1)
-
-        Create("TextLabel", {
-            BackgroundTransparency = 1, Position = UDim2.new(0, 12, 0, 0),
-            Size = UDim2.new(1, -60, 1, 0), Font = Enum.Font.Gotham,
-            Text = props.Name or "Toggle", TextColor3 = Theme.Text,
-            TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left, Parent = frame,
-        })
-
-        local track = Create("Frame", {
-            BackgroundColor3 = Theme.Tertiary,
-            Size = UDim2.new(0, 34, 0, 18),
-            Position = UDim2.new(1, -44, 0.5, -9), Parent = frame,
-        })
-        Corner(track, 9)
-
-        local knob = Create("Frame", {
-            BackgroundColor3 = Theme.Text, Size = UDim2.new(0, 14, 0, 14),
-            Position = UDim2.new(0, 2, 0.5, -7), Parent = track,
-        })
-        Corner(knob, 7)
-
-        local state = props.Default or false
-        local btn = Create("TextButton", {
-            BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, 0),
-            Text = "", Parent = frame,
-        })
-
-        local function render()
-            TweenService:Create(track, TweenInfo.new(0.15), {
-                BackgroundColor3 = state and Theme.Accent or Theme.Tertiary }):Play()
-            TweenService:Create(knob, TweenInfo.new(0.15), {
-                Position = state and UDim2.new(1, -16, 0.5, -7)
-                                 or UDim2.new(0, 2, 0.5, -7) }):Play()
-        end
-        render()
-
-        btn.MouseButton1Click:Connect(function()
-            state = not state
-            render()
-            if props.Callback then
-                local ok, err = pcall(props.Callback, state)
-                if not ok then warn(err) end
-            end
-        end)
-
-        return { Instance = frame, Get = function() return state end }
-    end
-
-    function F:Dropdown(props)
-        props = props or {}
-        local options = props.Options or {}
-        local selected = {}
-        if props.CurrentOption then
-            if type(props.CurrentOption) == "table" then selected = props.CurrentOption
-            else selected = { props.CurrentOption } end
-        end
-        local multi = props.MultipleOptions or false
-
-        local frame = Create("Frame", {
-            BackgroundColor3 = Theme.Secondary,
-            Size = UDim2.new(1, 0, 0, 34), Parent = page,
-        })
-        Corner(frame, 6); Stroke(frame, Theme.Stroke, 1)
-
-        Create("TextLabel", {
-            BackgroundTransparency = 1, Position = UDim2.new(0, 12, 0, 0),
-            Size = UDim2.new(0.5, -12, 1, 0), Font = Enum.Font.Gotham,
-            Text = props.Name or "Dropdown", TextColor3 = Theme.Text,
-            TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left, Parent = frame,
-        })
-        local valueLbl = Create("TextLabel", {
-            BackgroundTransparency = 1, Position = UDim2.new(0.5, 0, 0, 0),
-            Size = UDim2.new(0.5, -32, 1, 0), Font = Enum.Font.Gotham,
-            Text = (#selected > 0) and table.concat(selected, ", ") or "Select...",
-            TextColor3 = Theme.TextDim, TextSize = 12,
-            TextXAlignment = Enum.TextXAlignment.Right, Parent = frame,
-        })
-        local arrow = Create("TextLabel", {
-            BackgroundTransparency = 1, Position = UDim2.new(1, -24, 0, 0),
-            Size = UDim2.new(0, 20, 1, 0), Font = Enum.Font.GothamBold,
-            Text = "▾", TextColor3 = Theme.TextDim, TextSize = 12, Parent = frame,
-        })
-
-        local optionsFrame = Create("Frame", {
-            BackgroundColor3 = Theme.Background,
-            Position = UDim2.new(0, 0, 1, 4),
-            Size = UDim2.new(1, 0, 0, 0),
-            ClipsDescendants = true, Visible = false, Parent = frame,
-        })
-        Corner(optionsFrame, 6); Stroke(optionsFrame, Theme.Stroke, 1)
-        List(optionsFrame, { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder })
-        Pad(optionsFrame, 4)
-
-        local open = false
-        local function rebuild()
-            for _, c in ipairs(optionsFrame:GetChildren()) do
-                if c:IsA("TextButton") then c:Destroy() end
-            end
-            for _, opt in ipairs(options) do
-                local ob = Create("TextButton", {
-                    BackgroundColor3 = Theme.Secondary,
-                    Size = UDim2.new(1, 0, 0, 26), Font = Enum.Font.Gotham,
-                    Text = opt, TextColor3 = Theme.Text, TextSize = 12,
-                    AutoButtonColor = false, BorderSizePixel = 0, Parent = optionsFrame,
-                })
-                Corner(ob, 4)
-                ob.MouseEnter:Connect(function() ob.BackgroundColor3 = Theme.Hover end)
-                ob.MouseLeave:Connect(function() ob.BackgroundColor3 = Theme.Secondary end)
-                ob.MouseButton1Click:Connect(function()
-                    if multi then
-                        local found = false
-                        for i, v in ipairs(selected) do
-                            if v == opt then table.remove(selected, i); found = true; break end
-                        end
-                        if not found then table.insert(selected, opt) end
-                    else
-                        selected = { opt }
-                        open = false
-                        optionsFrame.Size = UDim2.new(1, 0, 0, 0)
-                        task.delay(0.15, function()
-                            if not open then optionsFrame.Visible = false end
-                        end)
-                        arrow.Text = "▾"
-                    end
-                    valueLbl.Text = (#selected > 0) and table.concat(selected, ", ") or "Select..."
-                    if props.Callback then
-                        local ok, err = pcall(props.Callback, selected)
-                        if not ok then warn(err) end
-                    end
-                end)
-            end
-            optionsFrame.Size = UDim2.new(1, 0, 0, #options * 28 + 8)
-        end
-
-        local btn = Create("TextButton", {
-            BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, 0),
-            Text = "", Parent = frame,
-        })
-        btn.MouseButton1Click:Connect(function()
-            open = not open
-            if open then
-                rebuild()
-                optionsFrame.Visible = true
-                optionsFrame.Size = UDim2.new(1, 0, 0, #options * 28 + 8)
-                arrow.Text = "▴"
-            else
-                optionsFrame.Size = UDim2.new(1, 0, 0, 0)
-                arrow.Text = "▾"
-                task.delay(0.15, function()
-                    if not open then optionsFrame.Visible = false end
-                end)
-            end
-        end)
-
-        return {
-            Instance = frame,
-            Get = function() return selected end,
-            Set = function(_, opts)
-                selected = opts or {}
-                valueLbl.Text = (#selected > 0) and table.concat(selected, ", ") or "Select..."
-            end,
-        }
-    end
-
-    function F:Divider()
-        return Create("Frame", {
-            BackgroundColor3 = Theme.Stroke, Size = UDim2.new(1, 0, 0, 1),
-            BorderSizePixel = 0, Parent = page,
-        })
-    end
-
-    return F
-end
-
-function Tab:Section(name)
-    local factories = makeElementFactories(self.Page)
-    factories:Section(name)
-    return factories
-end
-
-return CustomUI
+---------------------------------------------------------------------
+-- START
+---------------------------------------------------------------------
+refreshPlayerList()
+connectRelay()
+notify("Delta Hub Ready","Every device runs this. Same relay URL.",Theme.Good)
